@@ -27,9 +27,11 @@ def get_vit(cls=VisionTransformer, **kwargs):
 def get_darts(**kwargs):
     default_config = {
         'in_channels': 3, 'channels': 64, 'n_classes': 1000, 'n_layers': 8, 'auxiliary': False,
-        'n_nodes': 4, 'stem_multiplier': 3
+        'n_nodes': 4, 'stem_multiplier': 3,
+        'use_ac': False
     }
     default_config.update(kwargs)
+    print('using activation checkpointing for darts')
     return DartsNetwork(**default_config)
 
 def get_ofa(**kwargs):
@@ -174,7 +176,7 @@ def join_layers(self):
     print(f"There are {len(layers)} layers {self.__class__}")
     return layers
 
-def get_model(name, **kwargs):
+def get_model(name, args=None, **kwargs):
     model_class = name2model[name]
     if name == 'mobilenet':
         kwargs['classes'] = 10
@@ -182,8 +184,11 @@ def get_model(name, **kwargs):
         kwargs['num_classes'] = 10
     elif name.startswith('vit'):
         kwargs['num_classes'] = 10
+    elif name == 'darts':
+        kwargs['use_ac'] = args.use_ac
     ins = model_class(**kwargs)
-    ins.join_layers = types.MethodType(join_layers, ins)
+    if name != 'darts':
+        ins.join_layers = types.MethodType(join_layers, ins)
     return ins
 
 

@@ -1,6 +1,6 @@
 import os
 
-steps = 100
+steps = 50
 num_stages = [
     -1
 ]
@@ -12,7 +12,7 @@ gpus_ = [
 ]
 use_acs = [
     0,
-    # 1
+    1
 ]
 use_fp16s = [
     0,
@@ -20,7 +20,7 @@ use_fp16s = [
 ]
 use_pipelines = [
     0,
-    1
+    # 1
 ]
 use_zeros = [
     0,
@@ -33,7 +33,7 @@ zero_stages = [
 ]
 offloads = [
     'null',
-    # 'cpu',
+    'cpu',
     # 'nvme'
 ]
 img_sizes = [
@@ -41,10 +41,11 @@ img_sizes = [
     224
 ]
 batch_sizes = [
-    # 16,
+    # 8,
+    16,
     # 32,
     # 64,
-    128,
+    # 128,
     # 256,
     # 512,
     # 1024,
@@ -53,11 +54,11 @@ batch_sizes = [
 ]
 models = [
     # 'vit_s',
-    'vit_b',
+    # 'vit_b',
     # 'vit_h',
     # 'vit_g',
     # 'vit_10b',
-    # 'darts',
+    'darts',
     # 'ofa',
     # 'mobilenet',
     # 'resnet152'
@@ -94,12 +95,17 @@ for seed in seeds:
                                     for use_zero in use_zeros:
                                         if use_zero == 1 and use_pipeline == 1:
                                             continue # zero pipeline is not supported
+                                        if use_zero and not use_fp16:
+                                            continue # we only focus on zero fp16
                                         for zero_stage in zero_stages:
                                             for offload in offloads:
+                                                if not use_zero:
+                                                    offload = 'null'
                                                 cmd = cmd_gen(gpus, model, img_size, batch_size, steps, use_ac, use_fp16,
                                                     use_pipeline, num_stage, use_zero, zero_stage, offload, seed,
                                                     exp_name, debug)
-                                                commands.append(cmd)
+                                                if cmd not in commands:
+                                                    commands.append(cmd)
 
 
 for i, command in enumerate(commands):

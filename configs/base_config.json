@@ -54,7 +54,7 @@
         "contiguous_memory_optimization": true,
         "number_checkpoints": 2,
         "synchronize_checkpoint_boundary": false,
-        "profile": true
+        "profile": false
     },
     "wall_clock_breakdown": true
   }

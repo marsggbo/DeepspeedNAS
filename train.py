@@ -27,7 +27,6 @@ def get_args():
     parser = argparse.ArgumentParser(description='CIFAR')
     parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from distributed launcher')
     parser.add_argument('-s', '--steps', type=int, default=10, help='quit after this many steps')
-    parser.add_argument('-p', '--pipeline-parallel-size', type=int, default=0, help='pipeline parallelism')
     parser.add_argument('-z', '--zero-stage', type=int, default=0, help='zero stage [1, 2, 3]')
     parser.add_argument('--gpus', type=int, default=1)
     parser.add_argument('--use_ac', type=int, default=0, help='use activation checkpointing') # 1: True 0: False
@@ -54,7 +53,7 @@ def train_base(args, logger=logger, config_params=None):
     logger.info('Normal or DDP mode')
     deepspeed.runtime.utils.set_random_seed(args.seed)
 
-    net = get_model(args.model)
+    net = get_model(args.model, args)
     rm = RandomMutator(net)
     trainset = FakeDataset(args.img_size, 10, args.use_fp16)
 
@@ -66,6 +65,8 @@ def train_base(args, logger=logger, config_params=None):
         config_params=config_params)
     if args.use_fp16:
         engine.fp16_enabled()
+    if args.use_ac:
+        deepspeed.checkpointing.configure(None, args.deepspeed_config)
 
     dataloader = RepeatingLoader(dataloader)
     data_iter = iter(dataloader)
@@ -97,7 +98,8 @@ def train_base(args, logger=logger, config_params=None):
         throughput = BS * world_size / batch_time
         calc = f"{BS} (BS) * {world_size}($gpus) / {batch_time:.2f}(time)"
         ag, mag, rg, mrg, cm = get_memory_usage()
-        exp_log.add(batch_time, throughput)
+        if step>5:
+            exp_log.add(batch_time, throughput)
         torch.cuda.synchronize()
         if rank == 0:
             logger.info(f'[rank{rank}] step{step}: throughput is {calc}={throughput:.2f} img/sec loss: {loss}')
@@ -111,9 +113,11 @@ def train_pipe(args, part='parameters', logger=logger, config_params=None):
     logger.info('Pipeline mode')
     deepspeed.runtime.utils.set_random_seed(args.seed)
 
-    net = get_model(args.model)
+    net = get_model(args.model, args)
     rm = RandomMutator(net)
     criterion = torch.nn.CrossEntropyLoss()
+    if args.use_ac:
+        deepspeed.checkpointing.configure(None, args.deepspeed_config)
 
     rank = args.local_rank
     world_size = torch.distributed.get_world_size()
@@ -147,7 +151,8 @@ def train_pipe(args, part='parameters', logger=logger, config_params=None):
         throughput = BS / (end - start)
         calc = f"{BS} (BS) / {end - start:.2f}(time)"
         ag, mag, rg, mrg, cm = get_memory_usage()
-        exp_log.add(batch_time, throughput)
+        if step>5:
+            exp_log.add(batch_time, throughput)
         torch.cuda.synchronize()
         if rank == 0:
             logger.info(f'[rank{rank}] step{step}: throughput is {calc}={throughput:.2f} img/sec loss: {loss}')
@@ -161,8 +166,10 @@ def train_zero(args, logger=logger, config_params=None):
     logger.info('Zero mode')
     deepspeed.runtime.utils.set_random_seed(args.seed)
 
-    net = get_model(args.model)
+    net = get_model(args.model, args)
     rm = RandomMutator(net)
+    if args.use_ac:
+        deepspeed.checkpointing.configure(None, args.deepspeed_config)
 
     trainset = FakeDataset(args.img_size, 10, args.use_fp16)
     criterion = nn.CrossEntropyLoss()
@@ -197,11 +204,12 @@ def train_zero(args, logger=logger, config_params=None):
         throughput = BS* world_size / (end - start)
         calc = f"{BS} (BS) * {world_size}($gpus) / {end - start:.2f}(time)"
         ag, mag, rg, mrg, cm = get_memory_usage()
-        exp_log.add(batch_time, throughput)
+        if step>5:
+            exp_log.add(batch_time, throughput)
         torch.cuda.synchronize()
         if rank == 0:
             logger.info(f'[rank{rank}] step{step}: throughput is {calc}={throughput:.2f} img/sec loss: {loss}')
-            logger.info(f'[rank{rank}] step{step}: CPU Mem {cm:.2f} | GPU Mem-A({ag:.2f}) Max-Mem-A{mag:.2f} Mem-R({rg:.2f}) Max-Mem-R({mrg:.2f})')
+            logger.info(f'[rank{rank}] step{step}: CPU Mem {cm:.2f} | GPU Mem-A({ag:.2f}) Max-Mem-A({mag:.2f}) Mem-R({rg:.2f}) Max-Mem-R({mrg:.2f})')
     if rank == 0:
         exp_log.save_as_csv()
         exp_log.stats_and_save()
@@ -215,7 +223,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def init_exp(args, default_cfg_path='/home/xihe/xinhe/ColossalNAS/deep_speed/configs/base_config.json'):
+def init_exp(args, default_cfg_path='./configs/base_config.json'):
     model = args.model
     gpus = args.gpus
     batch_size = args.batch_size
@@ -236,7 +244,7 @@ def init_exp(args, default_cfg_path='/home/xihe/xinhe/ColossalNAS/deep_speed/con
     if use_zero:
         name += f'_zero'
         if args.offload in ['cpu', 'nvme']:
-            name += '_offload'
+            name += f'_offload({args.offload})'
     if use_pipeline:
         name += f'_pipeline'
     if use_fp16:
@@ -282,24 +290,27 @@ def init_exp(args, default_cfg_path='/home/xihe/xinhe/ColossalNAS/deep_speed/con
                         "offload_optimizer": {
                             "device": f"{args.offload}",
                             "nvme_path": "./local_nvme",
-                            "pin_memory": true,
+                            "pin_memory": True,
                             "buffer_count": 4,
-                            "fast_init": false
+                            "fast_init": False
                         },
                         "offload_param": {
                             "device": f"{args.offload}",
                             "nvme_path": "./local_nvme",
-                            "pin_memory": true,
+                            "pin_memory": True,
                             "buffer_count": 5,
                             "buffer_size": 1e8,
                             "max_in_cpu": 1e9
                         }
                     })
-    
+
+    config_params_file = f'{root_dir}/config.json'
+    args_file = f'{root_dir}/args.json'
+    args.deepspeed_config = config_params_file
     if os.environ['RANK'] == '0':
-        with open(f'{root_dir}/config.json', 'w') as f:
+        with open(config_params_file, 'w') as f:
             json.dump(config_params, f, indent=4)
-        with open(f'{root_dir}/args.json', 'w') as f:
+        with open(args_file, 'w') as f:
             json.dump(args.__dict__, f, indent=4)
         logger.info(f'args: {args.__dict__}')
     return logger, config_params
@@ -310,7 +321,7 @@ if __name__ == '__main__':
     if args.debug:
         from ipdb import set_trace
         set_trace()
-    logger, config_params = init_exp(args, '/home/xihe/xinhe/ColossalNAS/deep_speed/configs/base_config.json')
+    logger, config_params = init_exp(args)
     deepspeed.init_distributed(dist_backend=args.backend)
     args.local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(args.local_rank)
@@ -323,5 +334,4 @@ if __name__ == '__main__':
         else:
             train_base(args, logger=logger, config_params=config_params)
     except BaseException as e:
-        logger.info(traceback.format_exc(), ranks=[0])
-
+        logger.info(traceback.format_exc())
