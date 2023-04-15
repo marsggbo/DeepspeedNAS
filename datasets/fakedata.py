@@ -8,7 +8,7 @@ class FakeDataset(torch.utils.data.Dataset):
         self.use_fp16 = use_fp16 # 是否使用半精度
 
     def __len__(self):
-        return 100000  # 数据集大小为无限大
+        return 10000000  # 数据集大小为无限大
 
     def __getitem__(self, index):
         # 生成随机数据

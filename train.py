@@ -27,20 +27,20 @@ def get_args():
     parser = argparse.ArgumentParser(description='CIFAR')
     parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from distributed launcher')
     parser.add_argument('-s', '--steps', type=int, default=10, help='quit after this many steps')
-    parser.add_argument('-z', '--zero-stage', type=int, default=0, help='zero stage [1, 2, 3]')
     parser.add_argument('--gpus', type=int, default=1)
     parser.add_argument('--use_ac', type=int, default=0, help='use activation checkpointing') # 1: True 0: False
     parser.add_argument('--use_fp16', type=int, default=0) # 1: True 0: False
     parser.add_argument('--use_pipeline', type=int, default=0) # 1: True 0: False
     parser.add_argument('--num_stages', type=int, default=-1, help='number of stages in pipeline') # -1: auto, equal to #gpus
     parser.add_argument('--use_zero', type=int, default=0) # 1: True 0: False
-    parser.add_argument('--zero_stage', type=int, default=0) # 1: True 0: False
+    parser.add_argument('--zero_stage', type=int, default=3) # [1, 2, 3]
     parser.add_argument('--offload', type=str, default='') # 1: True 0: False
     parser.add_argument('--img_size', type=int, default=224, help='use img_size')
     parser.add_argument('--batch_size', type=int, default=32, help='global batch_size')
     parser.add_argument('--backend', type=str, default='nccl', help='distributed backend')
     parser.add_argument('--model', type=str, default='vit_b', help='model name')
     parser.add_argument('--debug', type=int, default=0, help='enable debug when set to 1')
+    parser.add_argument('--tune_cfg', type=int, default=0, help='enable tuning cfg when set to 1')
     parser.add_argument('--exp_name', type=str, default='') # 1: True 0: False
     parser.add_argument('--seed', type=int, default=1138, help='PRNG seed')
     parser = deepspeed.add_config_arguments(parser)
@@ -50,6 +50,8 @@ def get_args():
 
 def train_base(args, logger=logger, config_params=None):
     exp_log = ExpLog(args)
+    rank = args.local_rank
+    world_size = torch.distributed.get_world_size()
     logger.info('Normal or DDP mode')
     deepspeed.runtime.utils.set_random_seed(args.seed)
 
@@ -66,20 +68,19 @@ def train_base(args, logger=logger, config_params=None):
     if args.use_fp16:
         engine.fp16_enabled()
     if args.use_ac:
+        logger.info(f'[rank{rank}] To enable activation checkpointing from {args.deepspeed_config}')
         deepspeed.checkpointing.configure(None, args.deepspeed_config)
+        logger.info(f'[rank{rank}] Enable activation checkpointing Done')
 
     dataloader = RepeatingLoader(dataloader)
     data_iter = iter(dataloader)
 
-    rank = dist.get_rank()
     gas = engine.gradient_accumulation_steps()
 
     criterion = torch.nn.CrossEntropyLoss()
 
     total_steps = args.steps * engine.gradient_accumulation_steps()
     step = 0
-    rank = args.local_rank
-    world_size = torch.distributed.get_world_size()
     for step in range(total_steps):
         batch = next(data_iter)
         inputs = batch[0].to(engine.device)
@@ -131,7 +132,7 @@ def train_pipe(args, part='parameters', logger=logger, config_params=None):
 
     trainset = FakeDataset(args.img_size, 10, args.use_fp16)
 
-    engine, _, _, _ = deepspeed.initialize(
+    engine, _, dataloader, _ = deepspeed.initialize(
         args=args,
         model=net,
         model_parameters=[p for p in net.parameters() if p.requires_grad],
@@ -139,13 +140,15 @@ def train_pipe(args, part='parameters', logger=logger, config_params=None):
         config_params=config_params)
     if args.use_fp16:
         engine.fp16_enabled()
+    dataloader = RepeatingLoader(dataloader)
+    data_iter = iter(dataloader)
 
     BS = engine.train_batch_size()
     for step in range(args.steps):
         rm.reset()
         torch.cuda.synchronize()
         start = time()
-        loss = engine.train_batch()
+        loss = engine.train_batch(data_iter)
         end = time()
         batch_time = end - start
         throughput = BS / (end - start)
@@ -182,6 +185,7 @@ def train_zero(args, logger=logger, config_params=None):
         config_params=config_params)
     engine.fp16_enabled()
     engine.tput_timer.monitor_memory = True
+    trainloader = RepeatingLoader(trainloader)
 
     rank = args.local_rank
     world_size = torch.distributed.get_world_size()
@@ -236,7 +240,6 @@ def init_exp(args, default_cfg_path='./configs/base_config.json'):
     debug = args.debug
     exp_name = args.exp_name
     assert not (use_pipeline and use_zero), 'Cannot use both pipeline and zero'
-    assert not (use_pipeline and use_fp16), 'Cannot use both pipeline and fp16'
     set_seed(args.seed)
 
     date_of_run = datetime.now().strftime("%Y-%m-%d-%I:%M:%S_%p")
@@ -274,7 +277,7 @@ def init_exp(args, default_cfg_path='./configs/base_config.json'):
         # delattr(args, 'deepspeed_config')
     with open(default_cfg_path, 'r') as f:
         config_params = json.load(f)
-    config_params['train_batch_size'] = args.batch_size
+    config_params['train_micro_batch_size_per_gpu'] = args.batch_size
     config_params['deepspeed']['num_gpus'] = args.gpus
     if use_fp16:
         config_params['fp16']['enabled'] = True
@@ -283,7 +286,7 @@ def init_exp(args, default_cfg_path='./configs/base_config.json'):
     if use_pipeline:
         config_params['zero_optimization']['stage'] = 0
     if use_zero:
-            config_params['zero_optimization']['stage'] = 3
+            config_params['zero_optimization']['stage'] = args.zero_stage
             if args.offload in ['cpu', 'nvme']:
                 config_params['zero_optimization'].update(
                     {        
@@ -303,16 +306,19 @@ def init_exp(args, default_cfg_path='./configs/base_config.json'):
                             "max_in_cpu": 1e9
                         }
                     })
+    if args.tune_cfg:
+        config_params["autotuning"]["enabled"] = True
+        config_params["train_batch_size"] = 'auto'
+        config_params["gradient_accumulation_steps"] = 'auto'
 
     config_params_file = f'{root_dir}/config.json'
     args_file = f'{root_dir}/args.json'
     args.deepspeed_config = config_params_file
-    if os.environ['RANK'] == '0':
-        with open(config_params_file, 'w') as f:
-            json.dump(config_params, f, indent=4)
-        with open(args_file, 'w') as f:
-            json.dump(args.__dict__, f, indent=4)
-        logger.info(f'args: {args.__dict__}')
+    with open(config_params_file, 'w') as f:
+        json.dump(config_params, f, indent=4)
+    with open(args_file, 'w') as f:
+        json.dump(args.__dict__, f, indent=4)
+    logger.info(f'args: {args.__dict__}')
     return logger, config_params
 
 
