@@ -109,7 +109,7 @@ def train_base(args, logger=logger, config_params=None):
         exp_log.save_as_csv()
         exp_log.stats_and_save()
 
-def train_pipe(args, part='parameters', logger=logger, config_params=None):
+def train_pipe(args, part='uniform', logger=logger, config_params=None):
     exp_log = ExpLog(args)
     logger.info('Pipeline mode')
     deepspeed.runtime.utils.set_random_seed(args.seed)
